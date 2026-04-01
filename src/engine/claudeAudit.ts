@@ -1,31 +1,71 @@
 // ─────────────────────────────────────────────────────────────
 // engine/claudeAudit.ts
-// Uses the Anthropic Claude API to perform a "Worldview Audit"
-// on anime/manga synopses, scoring them for faith alignment.
+// Worldview Bridge — Claude API integration.
+//
+// Production:  calls POST /api/worldview-audit (Vercel Edge
+//              Function) so the API key stays server-side.
+// Development: falls back to a direct API call when an explicit
+//              apiKey is passed (e.g. from VITE_CLAUDE_API_KEY).
+//
+// Audit results are cached in localStorage ("bda-audit-cache")
+// so audits survive page reloads and don't re-bill the API for
+// titles that have already been evaluated at the same discernment
+// level.
 // ─────────────────────────────────────────────────────────────
 
 export interface WorldviewAudit {
-  faith_score: number;           // 0–10
+  faith_score: number;            // 0–10
   redemptive_archetypes: string[]; // detected positive patterns
-  concerns: string[];            // detected negative patterns
-  reasoning: string;             // brief explanation
+  concerns: string[];             // detected negative patterns
+  reasoning: string;              // brief explanation
 }
 
-// ─────── Prompt Template ───────
+// ═══ Persistent Audit Cache (localStorage) ═══════════════════
+//
+// Cache key format: `${entryId}-d${discernment}`
+// Stored as a plain JSON object in localStorage under "bda-audit-cache".
+// The cache is loaded once on module init and written after each
+// new entry is resolved.
+
+const AUDIT_CACHE_KEY = "bda-audit-cache";
+
+function loadCache(): Map<string, WorldviewAudit> {
+  try {
+    const raw = localStorage.getItem(AUDIT_CACHE_KEY);
+    if (!raw) return new Map();
+    const obj = JSON.parse(raw) as Record<string, WorldviewAudit>;
+    return new Map(Object.entries(obj));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveCache(cache: Map<string, WorldviewAudit>): void {
+  try {
+    // Keep the cache size bounded — evict oldest entries beyond 500
+    let entries = [...cache.entries()];
+    if (entries.length > 500) {
+      entries = entries.slice(entries.length - 500);
+    }
+    localStorage.setItem(AUDIT_CACHE_KEY, JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    // localStorage may be full or unavailable (private browsing)
+  }
+}
+
+// Initialise from localStorage — persists across page reloads
+const auditCache: Map<string, WorldviewAudit> = loadCache();
+
+// ═══ Prompt Builder ══════════════════════════════════════════
 
 function buildAuditPrompt(
   title: string,
   synopsis: string,
   genres: string[],
-  discernment: number // 0–10
+  discernment: number
 ): string {
-  // Scale the strictness of evaluation with discernment level
   const strictnessLabel =
-    discernment <= 3
-      ? "lenient"
-      : discernment <= 6
-        ? "moderate"
-        : "strict";
+    discernment <= 3 ? "lenient" : discernment <= 6 ? "moderate" : "strict";
 
   return `You are a faith-aligned content analyst. Your task is to evaluate an anime/manga synopsis for spiritual and moral alignment using a Christian worldview.
 
@@ -67,20 +107,75 @@ RESPOND WITH ONLY valid JSON, no markdown fences, no preamble:
 }`;
 }
 
-// ─────── API Call ───────
+// ═══ Heuristic Fallback ══════════════════════════════════════
+
+function fallbackAudit(genres: string[]): WorldviewAudit {
+  const genreSet = new Set(genres.map((g) => g.toLowerCase()));
+
+  let score = 5.0;
+  const positives: string[] = [];
+  const negatives: string[] = [];
+
+  if (genreSet.has("slice of life")) { score += 1.0; positives.push("Everyday virtue"); }
+  if (genreSet.has("adventure"))     { score += 0.5; positives.push("Heroic journey"); }
+  if (genreSet.has("drama"))         { score += 0.5; positives.push("Moral weight"); }
+  if (genreSet.has("sports"))        { score += 0.5; positives.push("Perseverance"); }
+  if (genreSet.has("ecchi"))         { score -= 2.0; negatives.push("Sexual fan-service"); }
+  if (genreSet.has("harem"))         { score -= 1.0; negatives.push("Harem dynamics"); }
+  if (genreSet.has("horror"))        { score -= 0.5; negatives.push("Dark themes"); }
+
+  return {
+    faith_score: Math.max(0, Math.min(10, score)),
+    redemptive_archetypes: positives,
+    concerns: negatives,
+    reasoning: "Heuristic estimate based on genre tags (Claude API unavailable).",
+  };
+}
+
+// ═══ Via Edge Function (Production) ══════════════════════════
 
 /**
- * Calls the Claude API to audit a synopsis.
+ * Calls the Vercel Edge Function at /api/worldview-audit.
+ * The Edge Function proxies the request to Claude server-side so
+ * the API key is never exposed in the browser bundle.
+ */
+async function auditViaEdge(
+  title: string,
+  synopsis: string,
+  genres: string[],
+  discernment: number,
+  entryId: string
+): Promise<WorldviewAudit> {
+  const cacheKey = `${entryId}-d${discernment}`;
+  const cached = auditCache.get(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const res = await fetch("/api/worldview-audit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title, synopsis, genres, discernment, entryId }),
+    });
+
+    if (!res.ok) return fallbackAudit(genres);
+
+    const audit = (await res.json()) as WorldviewAudit;
+    auditCache.set(cacheKey, audit);
+    saveCache(auditCache);
+    return audit;
+  } catch {
+    return fallbackAudit(genres);
+  }
+}
+
+// ═══ Direct API Call (Local Dev / Server-side) ════════════════
+
+/**
+ * Calls the Claude API directly using an explicit API key.
+ * Prefer auditViaEdge() for browser contexts — this is intended
+ * for server-side use or local development with VITE_CLAUDE_API_KEY.
  *
- * @param apiKey - Your Anthropic API key. In production, this should
- *   come from an environment variable or backend proxy, NEVER from
- *   the client bundle. For a Vite app, use a serverless function
- *   (Supabase Edge Function, Vercel API route, etc.) as a proxy.
- *
- * @param title - The title of the work
- * @param synopsis - The synopsis text to analyze
- * @param genres - Genre list for context
- * @param discernment - 0–10 discernment level
+ * @param apiKey - Anthropic API key. NEVER ship this in a public bundle.
  */
 export async function auditWithClaude(
   apiKey: string,
@@ -89,7 +184,6 @@ export async function auditWithClaude(
   genres: string[],
   discernment: number
 ): Promise<WorldviewAudit> {
-  // Skip audit for empty/missing synopses
   if (!synopsis || synopsis === "No synopsis available.") {
     return {
       faith_score: 5.0,
@@ -123,13 +217,14 @@ export async function auditWithClaude(
 
     const data = await response.json();
     const text = data.content
-      ?.map((block: any) => (block.type === "text" ? block.text : ""))
+      ?.map((block: { type: string; text: string }) =>
+        block.type === "text" ? block.text : ""
+      )
       .join("")
       .trim();
 
     if (!text) return fallbackAudit(genres);
 
-    // Strip markdown fences if present
     const clean = text.replace(/```json\s?|```/g, "").trim();
     const parsed = JSON.parse(clean);
 
@@ -145,49 +240,22 @@ export async function auditWithClaude(
   }
 }
 
-// ─────── Heuristic Fallback ───────
+// ═══ Batch Audit with Cache ═══════════════════════════════════
 
 /**
- * When the Claude API is unavailable, use a simple genre-based
- * heuristic so the app degrades gracefully.
- */
-function fallbackAudit(genres: string[]): WorldviewAudit {
-  const genreSet = new Set(genres.map((g) => g.toLowerCase()));
-
-  let score = 5.0; // neutral baseline
-  const positives: string[] = [];
-  const negatives: string[] = [];
-
-  // Positive genre signals
-  if (genreSet.has("slice of life")) { score += 1.0; positives.push("Everyday virtue"); }
-  if (genreSet.has("adventure"))     { score += 0.5; positives.push("Heroic journey"); }
-  if (genreSet.has("drama"))         { score += 0.5; positives.push("Moral weight"); }
-  if (genreSet.has("sports"))        { score += 0.5; positives.push("Perseverance"); }
-
-  // Negative genre signals
-  if (genreSet.has("ecchi"))         { score -= 2.0; negatives.push("Sexual fan-service"); }
-  if (genreSet.has("harem"))         { score -= 1.0; negatives.push("Harem dynamics"); }
-  if (genreSet.has("horror"))        { score -= 0.5; negatives.push("Dark themes"); }
-
-  return {
-    faith_score: Math.max(0, Math.min(10, score)),
-    redemptive_archetypes: positives,
-    concerns: negatives,
-    reasoning: "Heuristic estimate based on genre tags (Claude API unavailable).",
-  };
-}
-
-// ─────── Batch Audit with Caching ───────
-
-const auditCache = new Map<string, WorldviewAudit>();
-
-/**
- * Audit multiple entries with caching and rate limiting.
- * Claude's API has rate limits, so we process sequentially
- * with a delay between calls.
+ * Audit multiple entries using the Worldview Bridge.
+ *
+ * Resolution order for each entry:
+ *   1. localStorage cache (instant, no API call)
+ *   2. /api/worldview-audit Edge Function (production, apiKey optional)
+ *   3. Direct Claude API call (if apiKey is provided)
+ *   4. Heuristic fallback (if all else fails)
+ *
+ * Requests are processed sequentially with a configurable delay
+ * to stay within Claude's rate limits.
  */
 export async function batchAudit(
-  apiKey: string,
+  apiKey: string | undefined,
   entries: Array<{ id: string; title: string; synopsis: string; genres: string[] }>,
   discernment: number,
   delayMs = 500
@@ -195,29 +263,64 @@ export async function batchAudit(
   const results = new Map<string, WorldviewAudit>();
 
   for (const entry of entries) {
-    // Check cache first
     const cacheKey = `${entry.id}-d${discernment}`;
+
+    // 1. Check in-memory / localStorage cache
     if (auditCache.has(cacheKey)) {
       results.set(entry.id, auditCache.get(cacheKey)!);
       continue;
     }
 
-    const audit = await auditWithClaude(
-      apiKey,
-      entry.title,
-      entry.synopsis,
-      entry.genres,
-      discernment
-    );
+    let audit: WorldviewAudit;
+
+    // 2. Try the Edge Function (works in browser without exposing the key)
+    if (typeof window !== "undefined") {
+      audit = await auditViaEdge(
+        entry.title,
+        entry.synopsis,
+        entry.genres,
+        discernment,
+        entry.id
+      );
+    } else if (apiKey) {
+      // 3. Direct API call (server-side / local dev)
+      audit = await auditWithClaude(
+        apiKey,
+        entry.title,
+        entry.synopsis,
+        entry.genres,
+        discernment
+      );
+    } else {
+      // 4. Heuristic fallback
+      audit = fallbackAudit(entry.genres);
+    }
 
     auditCache.set(cacheKey, audit);
+    saveCache(auditCache);
     results.set(entry.id, audit);
 
-    // Rate limit delay between calls
     if (delayMs > 0) {
       await new Promise((r) => setTimeout(r, delayMs));
     }
   }
 
   return results;
+}
+
+// ═══ Cache Utilities (exported for diagnostics / settings UI) ══
+
+/** Returns the number of entries currently cached. */
+export function getAuditCacheSize(): number {
+  return auditCache.size;
+}
+
+/** Clears the in-memory and localStorage audit cache. */
+export function clearAuditCache(): void {
+  auditCache.clear();
+  try {
+    localStorage.removeItem(AUDIT_CACHE_KEY);
+  } catch {
+    // ignore
+  }
 }

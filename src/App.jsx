@@ -722,7 +722,7 @@ function TabBar({ tabs, active, onSelect, onRefresh }) {
 /* ═══ APP ═══ */
 export default function App(){
   const [query,setQuery]=useState("");const [focused,setFocused]=useState(false);const [modal,setModal]=useState(false);
-  const [settings,setSettings]=useState({discernment:2,maturity:2});
+  const [settings,setSettings]=useState(()=>{try{const s=localStorage.getItem("bda-settings");return s?{discernment:2,maturity:2,...JSON.parse(s)}:{discernment:2,maturity:2};}catch{return{discernment:2,maturity:2};}});
   const [loaded,setLoaded]=useState(false);
   const [likedIds,setLikedIds]=useState(new Set());const [vp,setVp]=useState([]);
   const [activeTab,setActiveTab]=useState("trending");
@@ -731,6 +731,8 @@ export default function App(){
   const [transitioning,setTransitioning]=useState(false);
   const [refreshKey,setRefreshKey]=useState(0);
   const searchRef=useRef(null);
+  // Persist Maturity and Discernment settings across sessions
+  useEffect(()=>{try{localStorage.setItem("bda-settings",JSON.stringify(settings));}catch{}},[settings]);
 
   const getLikedItems=useCallback(()=>{const all=[...SPIRIT_BOOKS,...CORPUS];return[...likedIds].map(id=>all.find(x=>x.id===id)).filter(Boolean);},[likedIds]);
 
